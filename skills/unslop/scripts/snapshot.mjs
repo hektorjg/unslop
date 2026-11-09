@@ -82,6 +82,11 @@ try {
     const pending = [...document.images].filter((image) => !image.complete);
     await Promise.race([Promise.all(pending.map(loaded)), pause(5000)]);
   });
+  // A stylesheet from another origin without CORS headers can't be read from inside the page,
+  // so stylesheets are fetched here, where CORS does not apply.
+  await page.exposeFunction("unslopReadCss", (href) =>
+    page.request.get(href).then((response) => (response.ok() ? response.text() : "")).catch(() => ""),
+  );
   const html = await page.evaluate(async ([label, scheme]) => {
     const LIMIT = 3_000_000;
     const absolute = (value, base = location.href) => {
@@ -123,15 +128,31 @@ try {
       }
       return result;
     };
+    const read = async (href) =>
+      (await window.unslopReadCss(href)) ||
+      (await fetch(href).then((response) => (response.ok ? response.text() : "")).catch(() => ""));
+    // Every sheet ends up in one <style>, where an @import that is not first is ignored,
+    // so imported sheets are inlined, each resolved against its own address.
+    const expand = async (css, base, depth = 0) => {
+      let result = css;
+      for (const [whole, , href, condition] of [...css.matchAll(/@import\s+(?:url\(\s*)?(['"]?)([^'")\s]+)\1\s*\)?\s*([^;]*);/g)]) {
+        const target = absolute(href, base);
+        const nested = depth < 5 && !/\b(layer|supports)\s*\(/i.test(condition) ? await read(target) : "";
+        const text = nested ? await urls(await expand(nested, target, depth + 1), target) : `@import url("${target}") ${condition};`;
+        result = result.split(whole).join(nested && condition.trim() ? `@media ${condition.trim()} {\n${text}\n}` : text);
+      }
+      return result;
+    };
 
     const css = [];
+    const unread = new Set();
     for (const sheet of document.styleSheets) {
       const owner = sheet.ownerNode;
       let text = "";
       let base = location.href;
       if (sheet.href) {
         base = sheet.href;
-        text = await fetch(sheet.href).then((response) => (response.ok ? response.text() : "")).catch(() => "");
+        text = await read(sheet.href);
       } else if (owner && owner.textContent.trim()) {
         text = owner.textContent;
       }
@@ -140,6 +161,8 @@ try {
           text = [...sheet.cssRules].map((rule) => rule.cssText).join("\n");
         } catch {}
       }
+      if (sheet.href && !text) unread.add(sheet.href);
+      text = await expand(text, base);
       const media = sheet.media && sheet.media.mediaText;
       css.push(media && media !== "all" ? `@media ${media} {\n${text}\n}` : text);
       css[css.length - 1] = await urls(css[css.length - 1], base);
@@ -152,9 +175,16 @@ try {
       const selected = images[index].currentSrc;
       if (selected) node.setAttribute("src", selected);
     });
-    copy.querySelectorAll("script, noscript, link[rel='stylesheet'], link[rel='preload'], link[rel='modulepreload'], style").forEach((node) => node.remove());
+    copy.querySelectorAll("script, noscript, link[rel='stylesheet'], link[rel='preload'], link[rel='modulepreload'], style").forEach((node) => {
+      // A stylesheet nothing could read stays linked from its absolute address instead of vanishing.
+      const href = node.matches("link[rel='stylesheet']") && absolute(node.getAttribute("href") ?? "");
+      if (href && unread.has(href)) node.setAttribute("href", href);
+      else node.remove();
+    });
     copy.querySelectorAll("[srcset]").forEach((node) => node.removeAttribute("srcset"));
-    copy.querySelectorAll("source").forEach((node) => node.remove());
+    // Only <picture> sources are redundant once the selected image is frozen; video and audio need theirs.
+    copy.querySelectorAll("picture > source").forEach((node) => node.remove());
+    copy.querySelectorAll("video[src], audio[src], video > source[src], audio > source[src]").forEach((node) => node.setAttribute("src", absolute(node.getAttribute("src"))));
     copy.querySelectorAll("[loading]").forEach((node) => node.removeAttribute("loading"));
     for (const node of copy.querySelectorAll("img[src], video[poster], image")) {
       const attr = node.tagName === "VIDEO" ? "poster" : node.tagName.toLowerCase() === "image" ? "href" : "src";
