@@ -147,6 +147,9 @@ try {
     const css = [];
     const unread = new Set();
     for (const sheet of document.styleSheets) {
+      // Disabled sheets are not part of what the page shows. Chrome lists an alternate sheet
+      // with disabled false but never applies it, so it is skipped by its rel.
+      if (sheet.disabled || sheet.ownerNode?.relList?.contains("alternate")) continue;
       const owner = sheet.ownerNode;
       let text = "";
       let base = location.href;
@@ -169,6 +172,14 @@ try {
     }
 
     const copy = document.documentElement.cloneNode(true);
+    // A cloned <canvas> is blank and the scripts that drew it are removed, so its pixels become its background.
+    const canvases = document.querySelectorAll("canvas");
+    copy.querySelectorAll("canvas").forEach((node, index) => {
+      try {
+        node.style.backgroundImage = `url("${canvases[index].toDataURL()}")`;
+        node.style.backgroundSize = "100% 100%";
+      } catch {}
+    });
     // Freeze the browser's selected image before removing responsive markup.
     const images = document.querySelectorAll("img");
     copy.querySelectorAll("img").forEach((node, index) => {
